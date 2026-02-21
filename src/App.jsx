@@ -1,36 +1,55 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { supabase } from './supabase'
 
-const ALLOWED_USERS = {
+/* ═══════════════ CONFIG ═══════════════ */
+const USERS = {
   kaziin: { password: 'bomzao123', displayName: 'kaziin' },
   gui: { password: 'bomzao321', displayName: 'gui' }
 }
 
-const SIGNAL_CHANNEL = 'voice-global'
+const CHANNEL = 'bomzao-voice-v2'
+const norm = (v) => v.trim().toLowerCase().replace(/\s+/g, '')
 
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' }
-]
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceCandidatePoolSize: 10
+}
 
-const normalize = (v) => v.trim().toLowerCase().replace(/\s+/g, '')
+function log(...args) {
+  console.log('[BOMZAO]', ...args)
+}
 
+/* ═══════════════ APP ═══════════════ */
 function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [user, setUser] = useState(() => {
-    try {
-      const saved = localStorage.getItem('bomzao_user')
-      return saved ? JSON.parse(saved) : null
-    } catch { return null }
+    try { const s = localStorage.getItem('bomzao_user'); return s ? JSON.parse(s) : null }
+    catch { return null }
   })
   const [error, setError] = useState('')
   const [status, setStatus] = useState(() => {
-    try { return localStorage.getItem('bomzao_user') ? 'Logado. Entre no canal para falar.' : 'Desconectado' }
-    catch { return 'Desconectado' }
+    try { return localStorage.getItem('bomzao_user') ? 'Entre no canal para falar.' : '' }
+    catch { return '' }
   })
   const [connected, setConnected] = useState(false)
   const [micMuted, setMicMuted] = useState(false)
@@ -39,237 +58,253 @@ function App() {
   const [peerState, setPeerState] = useState('')
   const [onlineUsers, setOnlineUsers] = useState([])
   const [hasVideo, setHasVideo] = useState(true)
+  const [remoteUsername, setRemoteUsername] = useState('')
 
   const channelRef = useRef(null)
   const pcRef = useRef(null)
   const localStreamRef = useRef(null)
   const screenStreamRef = useRef(null)
   const remoteVideoRef = useRef(null)
+  const remoteAudioRef = useRef(null)
   const localVideoRef = useRef(null)
-  const candidateQueue = useRef([])
+  const candidateQ = useRef([])
   const makingOffer = useRef(false)
   const selfIdRef = useRef(null)
   const userRef = useRef(null)
+  const politeRef = useRef(true)
 
   useEffect(() => { userRef.current = user }, [user])
 
   const selfId = useMemo(() => {
     if (!user) return null
-    const id = `${user.displayName}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const id = `${user.displayName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     selfIdRef.current = id
     return id
   }, [user])
 
-  useEffect(() => {
-    return () => { void cleanup() }
-  }, [])
+  useEffect(() => () => { void hangup() }, [])
 
-  /* ───── LOGIN ───── */
+  /* ─── LOGIN ─── */
   const login = (e) => {
     e.preventDefault()
     setError('')
-    const u = normalize(username)
-    const p = normalize(password)
-    const found = ALLOWED_USERS[u]
-    if (!found || normalize(found.password) !== p) {
+    const found = USERS[norm(username)]
+    if (!found || norm(found.password) !== norm(password)) {
       setError('Usuário ou senha inválidos')
       return
     }
     setUser(found)
     localStorage.setItem('bomzao_user', JSON.stringify(found))
-    setStatus('Logado. Entre no canal para falar.')
+    setStatus('Entre no canal para falar.')
   }
 
-  /* ───── SIGNALING ───── */
-  const sendSignal = useCallback(async (type, data) => {
-    if (!channelRef.current || !selfIdRef.current) return
-    await channelRef.current.send({
+  /* ─── SIGNALING ─── */
+  const send = useCallback(async (type, data) => {
+    const ch = channelRef.current
+    if (!ch || !selfIdRef.current) return
+    log('>> send', type)
+    await ch.send({
       type: 'broadcast',
-      event: 'signal',
-      payload: {
-        type,
-        payload: data,
-        from: selfIdRef.current,
-        username: userRef.current?.displayName,
-        ts: Date.now()
-      }
+      event: 'rtc',
+      payload: { type, data, from: selfIdRef.current, user: userRef.current?.displayName, t: Date.now() }
     })
   }, [])
 
-  /* ───── PEER CONNECTION ───── */
-  const createPeer = useCallback(() => {
-    const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-
-    peer.onicecandidate = ({ candidate }) => {
-      if (candidate) sendSignal('candidate', { candidate })
+  /* ─── CREATE PEER ─── */
+  const buildPeer = useCallback(() => {
+    if (pcRef.current) {
+      pcRef.current.close()
+      pcRef.current = null
     }
 
-    peer.ontrack = (e) => {
-      if (remoteVideoRef.current && e.streams[0]) {
-        remoteVideoRef.current.srcObject = e.streams[0]
-      }
-    }
+    const pc = new RTCPeerConnection(RTC_CONFIG)
+    log('peer created')
 
-    peer.oniceconnectionstatechange = () => {
-      const s = peer.iceConnectionState
-      setPeerState(s)
-      if (s === 'connected' || s === 'completed') {
-        setStatus('Conectado — voz e vídeo em tempo real')
-      } else if (s === 'disconnected') {
-        setStatus('Conexão instável — reconectando...')
-      } else if (s === 'failed') {
-        setStatus('Conexão falhou — tente reconectar')
-        peer.restartIce()
-      }
-    }
-
-    peer.onnegotiationneeded = async () => {
-      try {
-        makingOffer.current = true
-        const offer = await peer.createOffer()
-        if (peer.signalingState !== 'stable') return
-        await peer.setLocalDescription(offer)
-        await sendSignal('offer', { offer: peer.localDescription })
-      } catch { } finally {
-        makingOffer.current = false
-      }
-    }
-
+    // Add local tracks BEFORE any negotiation
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        peer.addTrack(track, localStreamRef.current)
+      localStreamRef.current.getTracks().forEach((t) => {
+        log('adding local track', t.kind)
+        pc.addTrack(t, localStreamRef.current)
       })
     }
 
-    pcRef.current = peer
-    return peer
-  }, [sendSignal])
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) send('ice', candidate)
+    }
 
-  const flushCandidates = useCallback(async () => {
+    pc.ontrack = (e) => {
+      log('ontrack', e.track.kind, e.streams.length)
+      const stream = e.streams[0]
+      if (!stream) return
+
+      // Always set video element
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream
+        remoteVideoRef.current.play().catch(() => {})
+      }
+      // Also set dedicated audio element for reliability
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = stream
+        remoteAudioRef.current.play().catch(() => {})
+      }
+    }
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState
+      log('ice state:', s)
+      setPeerState(s)
+      if (s === 'connected' || s === 'completed') setStatus('Conectado')
+      else if (s === 'disconnected') setStatus('Reconectando...')
+      else if (s === 'failed') { setStatus('Falhou — reconectando...'); pc.restartIce() }
+    }
+
+    // Perfect negotiation: onnegotiationneeded
+    pc.onnegotiationneeded = async () => {
+      try {
+        makingOffer.current = true
+        log('negotiationneeded → creating offer')
+        await pc.setLocalDescription()
+        send('description', pc.localDescription)
+      } catch (err) { log('nego err', err) }
+      finally { makingOffer.current = false }
+    }
+
+    pcRef.current = pc
+    return pc
+  }, [send])
+
+  /* ─── FLUSH ICE QUEUE ─── */
+  const flush = useCallback(async () => {
     const pc = pcRef.current
-    if (!pc || !pc.remoteDescription) return
-    while (candidateQueue.current.length > 0) {
-      const c = candidateQueue.current.shift()
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)) } catch { }
+    if (!pc?.remoteDescription) return
+    while (candidateQ.current.length) {
+      try { await pc.addIceCandidate(candidateQ.current.shift()) }
+      catch { }
     }
   }, [])
 
-  /* ───── HANDLE INCOMING SIGNALS ───── */
-  const handleSignal = useCallback(async ({ payload }) => {
-    if (!payload || payload.from === selfIdRef.current) return
+  /* ─── HANDLE SIGNAL ─── */
+  const onSignal = useCallback(async ({ payload: msg }) => {
+    if (!msg || msg.from === selfIdRef.current) return
+    log('<< recv', msg.type, 'from', msg.user)
 
-    if (payload.type === 'join') {
-      const polite = selfIdRef.current < payload.from
-      if (!polite) {
-        const peer = pcRef.current || createPeer()
-        const offer = await peer.createOffer()
-        await peer.setLocalDescription(offer)
-        await sendSignal('offer', { offer: peer.localDescription })
+    if (msg.user) setRemoteUsername(msg.user)
+
+    // Join → we decide who is polite, create peer, let onnegotiationneeded fire
+    if (msg.type === 'join') {
+      politeRef.current = selfIdRef.current < msg.from
+      log('polite?', politeRef.current)
+      if (!pcRef.current) buildPeer()
+      // Impolite side creates first offer via onnegotiationneeded (already fires after addTrack)
+      // If peer already exists, force renegotiation
+      if (pcRef.current && pcRef.current.signalingState === 'stable' && !politeRef.current) {
+        const offer = await pcRef.current.createOffer()
+        await pcRef.current.setLocalDescription(offer)
+        send('description', pcRef.current.localDescription)
       }
       return
     }
 
-    if (payload.type === 'offer') {
-      const polite = selfIdRef.current < payload.from
-      const pc = pcRef.current || createPeer()
-      const collision = makingOffer.current || pc.signalingState !== 'stable'
-      if (!polite && collision) return
+    // SDP description (offer or answer)
+    if (msg.type === 'description') {
+      const desc = msg.data
+      const pc = pcRef.current || buildPeer()
+      const isOffer = desc.type === 'offer'
+      const collision = isOffer && (makingOffer.current || pc.signalingState !== 'stable')
 
-      await pc.setRemoteDescription(new RTCSessionDescription(payload.payload.offer))
-      await flushCandidates()
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      await sendSignal('answer', { answer: pc.localDescription })
+      if (collision && !politeRef.current) {
+        log('ignoring colliding offer (impolite)')
+        return
+      }
+
+      if (collision && politeRef.current) {
+        log('rolling back (polite)')
+        await pc.setLocalDescription({ type: 'rollback' })
+      }
+
+      log('setRemoteDescription', desc.type)
+      await pc.setRemoteDescription(desc)
+      await flush()
+
+      if (isOffer) {
+        log('creating answer')
+        await pc.setLocalDescription()
+        send('description', pc.localDescription)
+      }
       return
     }
 
-    if (payload.type === 'answer') {
-      if (!pcRef.current) return
-      try {
-        await pcRef.current.setRemoteDescription(new RTCSessionDescription(payload.payload.answer))
-        await flushCandidates()
-      } catch { }
-      return
-    }
-
-    if (payload.type === 'candidate') {
-      if (!pcRef.current || !pcRef.current.remoteDescription) {
-        candidateQueue.current.push(payload.payload.candidate)
+    // ICE candidate
+    if (msg.type === 'ice') {
+      if (!pcRef.current?.remoteDescription) {
+        candidateQ.current.push(msg.data)
       } else {
-        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(payload.payload.candidate)) } catch { }
+        try { await pcRef.current.addIceCandidate(msg.data) } catch { }
       }
     }
-  }, [createPeer, flushCandidates, sendSignal])
+  }, [buildPeer, flush, send])
 
-  /* ───── CONNECT ───── */
-  const startCall = async () => {
+  /* ─── CONNECT ─── */
+  const joinChannel = async () => {
     try {
       setError('')
-      setStatus('Obtendo câmera e microfone...')
+      setStatus('Acessando dispositivos...')
 
-      // Tenta com vídeo, fallback para só áudio se câmera indisponível
       let stream
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 60 } }
+          video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
         })
         setHasVideo(true)
       } catch {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: false
-        })
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
         setHasVideo(false)
-        setError('Câmera indisponível — conectado só com áudio')
       }
 
       localStreamRef.current = stream
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream
 
       setStatus('Entrando no canal...')
 
-      const channel = supabase.channel(SIGNAL_CHANNEL, {
+      const ch = supabase.channel(CHANNEL, {
         config: { broadcast: { self: false }, presence: { key: selfId } }
       })
 
-      channel.on('broadcast', { event: 'signal' }, handleSignal)
+      ch.on('broadcast', { event: 'rtc' }, onSignal)
 
-      // Presença: mostra quem está online no canal
-      channel.on('presence', { event: 'sync' }, () => {
-        const state = channel.presenceState()
-        const users = Object.values(state).flat().map((p) => p.username).filter(Boolean)
-        setOnlineUsers([...new Set(users)])
+      ch.on('presence', { event: 'sync' }, () => {
+        const ps = ch.presenceState()
+        const names = [...new Set(Object.values(ps).flat().map((p) => p.username).filter(Boolean))]
+        setOnlineUsers(names)
       })
 
-      await channel.subscribe(async (state) => {
-        if (state === 'SUBSCRIBED') {
-          await channel.track({ username: userRef.current?.displayName, joinedAt: Date.now() })
-          setStatus('No canal — aguardando outro usuário...')
+      await ch.subscribe(async (s) => {
+        if (s === 'SUBSCRIBED') {
+          log('subscribed to channel')
+          await ch.track({ username: userRef.current?.displayName, joinedAt: Date.now() })
           setConnected(true)
-          await sendSignal('join', { ready: true })
+          setStatus('No canal — aguardando...')
+          // Small delay to ensure presence is tracked before signaling
+          setTimeout(() => send('join', { ready: true }), 300)
         }
       })
 
-      channelRef.current = channel
+      channelRef.current = ch
     } catch (err) {
-      setStatus('Erro ao entrar no canal')
-      setError(err.message || 'Falha ao iniciar chamada')
-      await cleanup()
+      setError(err.message || 'Erro')
+      setStatus('Erro ao conectar')
+      await hangup()
     }
   }
 
-  /* ───── MUTE / CAMERA ───── */
+  /* ─── MIC / CAM ─── */
   const toggleMic = () => {
     if (!localStreamRef.current) return
     const next = !micMuted
     localStreamRef.current.getAudioTracks().forEach((t) => { t.enabled = !next })
     setMicMuted(next)
   }
-
   const toggleCam = () => {
     if (!localStreamRef.current) return
     const next = !camOff
@@ -277,191 +312,191 @@ function App() {
     setCamOff(next)
   }
 
-  /* ───── SCREEN SHARE ───── */
-  const startScreenShare = async () => {
+  /* ─── SCREEN SHARE ─── */
+  const shareScreen = async () => {
     try {
       const screen = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
-        audio: false
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
       })
       screenStreamRef.current = screen
-      const screenTrack = screen.getVideoTracks()[0]
+      const vTrack = screen.getVideoTracks()[0]
 
       if (pcRef.current) {
         const sender = pcRef.current.getSenders().find((s) => s.track?.kind === 'video')
-        if (sender) await sender.replaceTrack(screenTrack)
+        if (sender) {
+          await sender.replaceTrack(vTrack)
+          log('replaced video track with screen')
+        } else {
+          // No video sender exists (audio-only) → add the screen track
+          pcRef.current.addTrack(vTrack, screen)
+          log('added screen track as new sender')
+        }
       }
 
       if (localVideoRef.current) localVideoRef.current.srcObject = screen
-
-      screenTrack.onended = () => stopScreenShare()
+      vTrack.onended = () => unshareScreen()
       setSharing(true)
     } catch (err) {
-      if (err.name !== 'NotAllowedError') setError('Erro ao compartilhar tela: ' + err.message)
+      if (err.name !== 'NotAllowedError') setError('Erro: ' + err.message)
     }
   }
 
-  const stopScreenShare = async () => {
+  const unshareScreen = async () => {
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((t) => t.stop())
       screenStreamRef.current = null
     }
     if (localStreamRef.current && pcRef.current) {
-      const camTrack = localStreamRef.current.getVideoTracks()[0]
-      if (camTrack) {
-        const sender = pcRef.current.getSenders().find((s) => s.track?.kind === 'video' || s.track === null)
-        if (sender) await sender.replaceTrack(camTrack)
+      const cam = localStreamRef.current.getVideoTracks()[0]
+      if (cam) {
+        const sender = pcRef.current.getSenders().find((s) => s.track?.kind === 'video' || !s.track)
+        if (sender) await sender.replaceTrack(cam)
       }
     }
     if (localVideoRef.current && localStreamRef.current) localVideoRef.current.srcObject = localStreamRef.current
     setSharing(false)
   }
 
-  /* ───── DISCONNECT ───── */
-  const cleanup = async () => {
-    setConnected(false)
-    setSharing(false)
-    setMicMuted(false)
-    setCamOff(false)
-    setPeerState('')
-    setOnlineUsers([])
-    setHasVideo(true)
-    candidateQueue.current = []
+  /* ─── HANGUP ─── */
+  const hangup = async () => {
+    setConnected(false); setSharing(false); setMicMuted(false); setCamOff(false)
+    setPeerState(''); setOnlineUsers([]); setHasVideo(true); setRemoteUsername('')
+    candidateQ.current = []; makingOffer.current = false; politeRef.current = true
 
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop())
-      screenStreamRef.current = null
-    }
+    ;[screenStreamRef, localStreamRef].forEach((ref) => {
+      if (ref.current) { ref.current.getTracks().forEach((t) => t.stop()); ref.current = null }
+    })
+
     if (pcRef.current) {
-      pcRef.current.onicecandidate = null
-      pcRef.current.ontrack = null
-      pcRef.current.oniceconnectionstatechange = null
-      pcRef.current.onnegotiationneeded = null
-      pcRef.current.close()
-      pcRef.current = null
+      pcRef.current.onicecandidate = null; pcRef.current.ontrack = null
+      pcRef.current.oniceconnectionstatechange = null; pcRef.current.onnegotiationneeded = null
+      pcRef.current.close(); pcRef.current = null
     }
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop())
-      localStreamRef.current = null
-    }
-    if (channelRef.current) {
-      await supabase.removeChannel(channelRef.current)
-      channelRef.current = null
-    }
+    if (channelRef.current) { await supabase.removeChannel(channelRef.current); channelRef.current = null }
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null
     if (localVideoRef.current) localVideoRef.current.srcObject = null
 
-    if (userRef.current) setStatus('Desconectado do canal')
-    else setStatus('Desconectado')
+    if (userRef.current) setStatus('Desconectado')
+    else setStatus('')
   }
 
   const logout = async () => {
-    await cleanup()
-    setUser(null)
-    localStorage.removeItem('bomzao_user')
-    setUsername('')
-    setPassword('')
-    setError('')
+    await hangup(); setUser(null); localStorage.removeItem('bomzao_user')
+    setUsername(''); setPassword(''); setError('')
   }
 
-  /* ───── RENDER: LOGIN ───── */
+  /* ═══════════════ RENDER ═══════════════ */
   if (!user) {
     return (
-      <main className="page">
-        <section className="card">
-          <h1>BOMZAO CALLS</h1>
-          <p className="subtitle">Login</p>
-          <form onSubmit={login} className="form">
-            <label>
-              Usuário
-              <input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="kaziin ou gui"
-                autoComplete="username"
-              />
-            </label>
-            <label>
-              Senha
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Digite sua senha"
-                autoComplete="current-password"
-              />
-            </label>
-            {error && <p className="error">{error}</p>}
-            <button type="submit">Entrar</button>
+      <main className="loginPage">
+        <div className="loginCard">
+          <div className="loginLogo">
+            <div className="logoIcon">B</div>
+            <h1>BOMZAO CALLS</h1>
+            <p className="loginSub">Conecte-se para entrar no canal</p>
+          </div>
+          <form onSubmit={login} className="loginForm">
+            <div className="inputGroup">
+              <input value={username} onChange={(e) => setUsername(e.target.value)}
+                placeholder="Usuário" autoComplete="username" />
+            </div>
+            <div className="inputGroup">
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                placeholder="Senha" autoComplete="current-password" />
+            </div>
+            {error && <p className="err">{error}</p>}
+            <button type="submit" className="loginBtn">Entrar</button>
           </form>
-        </section>
+          <p className="loginFooter">Acesso exclusivo para membros</p>
+        </div>
       </main>
     )
   }
 
-  /* ───── RENDER: CALL ───── */
+  const isLive = peerState === 'connected' || peerState === 'completed'
+
   return (
-    <main className="page">
-      <section className="card wide">
-        <div className="topBar">
-          <h1>BOMZAO CALLS</h1>
-          <div className="topRight">
-            <span className="userLabel">{user.displayName}</span>
-            <button onClick={logout} className="secondary small">Sair</button>
-          </div>
+    <main className="appPage">
+      {/* Hidden audio element — guarantees audio always plays */}
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: 'none' }} />
+
+      {/* SIDEBAR */}
+      <aside className="sidebar">
+        <div className="sideTop">
+          <div className="logoSmall">B</div>
+          <span className="brandSmall">BOMZAO</span>
         </div>
 
-        <div className="channelBox">
-          <div className="channelHeader">
-            <h2>Canal de Voz e Vídeo</h2>
-            <span className={'statusBadge ' + (peerState === 'connected' || peerState === 'completed' ? 'online' : '')}>
-              {status}
-            </span>
+        <div className="channelList">
+          <p className="channelLabel">CANAL DE VOZ</p>
+          <div className={'channelItem ' + (connected ? 'active' : '')}>
+            <span className="channelIcon">🔊</span>
+            <span>Geral</span>
+            {isLive && <span className="liveDot" />}
           </div>
-
           {onlineUsers.length > 0 && (
-            <div className="onlineList">
-              <span className="onlineLabel">No canal:</span>
+            <div className="memberList">
               {onlineUsers.map((u) => (
-                <span key={u} className="onlineUser">{u}</span>
+                <div key={u} className="member">
+                  <span className="memberDot" />
+                  <span>{u}</span>
+                </div>
               ))}
             </div>
           )}
+        </div>
 
-          <div className="videoGrid">
-            <div className="videoCard">
-              <p>Você {sharing ? '(Tela)' : ''} {!hasVideo && connected ? '(Só áudio)' : ''}</p>
-              <video ref={localVideoRef} autoPlay muted playsInline />
-            </div>
-            <div className="videoCard">
-              <p>Remoto</p>
-              <video ref={remoteVideoRef} autoPlay playsInline />
-            </div>
+        <div className="sideBottom">
+          <div className="userInfo">
+            <div className="avatar">{user.displayName[0].toUpperCase()}</div>
+            <span className="uname">{user.displayName}</span>
           </div>
+          <button onClick={logout} className="logoutBtn">Sair</button>
+        </div>
+      </aside>
 
-          <div className="controls">
-            {!connected ? (
-              <button onClick={startCall} className="ctrlBtn connect">Conectar</button>
-            ) : (
-              <>
-                <button onClick={toggleMic} className={'ctrlBtn ' + (micMuted ? 'danger' : '')}>
-                  {micMuted ? 'Mic OFF' : 'Mic ON'}
-                </button>
-                <button onClick={toggleCam} className={'ctrlBtn ' + (camOff ? 'danger' : '')}>
-                  {camOff ? 'Cam OFF' : 'Cam ON'}
-                </button>
-                {!sharing ? (
-                  <button onClick={startScreenShare} className="ctrlBtn share">Compartilhar Tela</button>
-                ) : (
-                  <button onClick={stopScreenShare} className="ctrlBtn danger">Parar Tela</button>
-                )}
-                <button onClick={cleanup} className="ctrlBtn danger">Desconectar</button>
-              </>
-            )}
+      {/* MAIN */}
+      <section className="mainArea">
+        <header className="mainHeader">
+          <h2>🔊 Geral</h2>
+          <span className={'badge ' + (isLive ? 'live' : '')}>{status}</span>
+        </header>
+
+        <div className="videoArea">
+          <div className="vidBox">
+            <video ref={localVideoRef} autoPlay muted playsInline />
+            <span className="vidLabel">
+              {user.displayName} {sharing ? '(Tela)' : ''} {!hasVideo && connected ? '(Áudio)' : ''}
+            </span>
+          </div>
+          <div className="vidBox">
+            <video ref={remoteVideoRef} autoPlay playsInline />
+            <span className="vidLabel">{remoteUsername || '—'}</span>
           </div>
         </div>
 
-        {error && <p className="error">{error}</p>}
+        <div className="toolbar">
+          {!connected ? (
+            <button onClick={joinChannel} className="tbtn join">Conectar</button>
+          ) : (
+            <>
+              <button onClick={toggleMic} className={'tbtn ' + (micMuted ? 'off' : 'on')}>
+                {micMuted ? '🔇 Mutado' : '🎙️ Mic'}
+              </button>
+              <button onClick={toggleCam} className={'tbtn ' + (camOff ? 'off' : 'on')}>
+                {camOff ? '📷 Cam Off' : '📹 Cam'}
+              </button>
+              {!sharing
+                ? <button onClick={shareScreen} className="tbtn screen">🖥️ Tela</button>
+                : <button onClick={unshareScreen} className="tbtn off">⏹️ Parar</button>
+              }
+              <button onClick={hangup} className="tbtn hang">✖ Sair</button>
+            </>
+          )}
+        </div>
+
+        {error && <p className="err">{error}</p>}
       </section>
     </main>
   )
