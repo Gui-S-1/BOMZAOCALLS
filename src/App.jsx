@@ -21,9 +21,17 @@ const normalize = (v) => v.trim().toLowerCase().replace(/\s+/g, '')
 function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
-  const [user, setUser] = useState(null)
+  const [user, setUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('bomzao_user')
+      return saved ? JSON.parse(saved) : null
+    } catch { return null }
+  })
   const [error, setError] = useState('')
-  const [status, setStatus] = useState('Desconectado')
+  const [status, setStatus] = useState(() => {
+    try { return localStorage.getItem('bomzao_user') ? 'Logado. Entre no canal para falar.' : 'Desconectado' }
+    catch { return 'Desconectado' }
+  })
   const [connected, setConnected] = useState(false)
   const [micMuted, setMicMuted] = useState(false)
   const [camOff, setCamOff] = useState(false)
@@ -68,6 +76,7 @@ function App() {
       return
     }
     setUser(found)
+    localStorage.setItem('bomzao_user', JSON.stringify(found))
     setStatus('Logado. Entre no canal para falar.')
   }
 
@@ -349,6 +358,7 @@ function App() {
   const logout = async () => {
     await cleanup()
     setUser(null)
+    localStorage.removeItem('bomzao_user')
     setUsername('')
     setPassword('')
     setError('')
