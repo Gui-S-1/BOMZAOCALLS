@@ -127,6 +127,45 @@ button.small { padding: 7px 12px; font-size: 0.82rem; }
   margin-bottom: 10px;
 }
 
+/* ───── ONLINE LIST ───── */
+.onlineList {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: #1b1f27;
+  border-radius: 8px;
+  border: 1px solid #2d3442;
+}
+
+.onlineLabel {
+  font-size: 0.82rem;
+  color: #8b95a8;
+}
+
+.onlineUser {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  background: #1b4332;
+  color: #52b788;
+  border-radius: 6px;
+}
+
+.onlineUser::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  background: #52b788;
+  border-radius: 50%;
+  display: inline-block;
+}
+
 .statusBadge {
   font-size: 0.82rem;
   padding: 4px 10px;

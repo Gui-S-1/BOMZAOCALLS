@@ -29,6 +29,8 @@ function App() {
   const [camOff, setCamOff] = useState(false)
   const [sharing, setSharing] = useState(false)
   const [peerState, setPeerState] = useState('')
+  const [onlineUsers, setOnlineUsers] = useState([])
+  const [hasVideo, setHasVideo] = useState(true)
 
   const channelRef = useRef(null)
   const pcRef = useRef(null)
@@ -196,13 +198,27 @@ function App() {
       setError('')
       setStatus('Obtendo câmera e microfone...')
 
-      localStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 60 } }
-      })
+      // Tenta com vídeo, fallback para só áudio se câmera indisponível
+      let stream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 60 } }
+        })
+        setHasVideo(true)
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false
+        })
+        setHasVideo(false)
+        setError('Câmera indisponível — conectado só com áudio')
+      }
+
+      localStreamRef.current = stream
 
       if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current
+        localVideoRef.current.srcObject = stream
       }
 
       setStatus('Entrando no canal...')
@@ -213,8 +229,16 @@ function App() {
 
       channel.on('broadcast', { event: 'signal' }, handleSignal)
 
+      // Presença: mostra quem está online no canal
+      channel.on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState()
+        const users = Object.values(state).flat().map((p) => p.username).filter(Boolean)
+        setOnlineUsers([...new Set(users)])
+      })
+
       await channel.subscribe(async (state) => {
         if (state === 'SUBSCRIBED') {
+          await channel.track({ username: userRef.current?.displayName, joinedAt: Date.now() })
           setStatus('No canal — aguardando outro usuário...')
           setConnected(true)
           await sendSignal('join', { ready: true })
@@ -291,6 +315,8 @@ function App() {
     setMicMuted(false)
     setCamOff(false)
     setPeerState('')
+    setOnlineUsers([])
+    setHasVideo(true)
     candidateQueue.current = []
 
     if (screenStreamRef.current) {
@@ -383,9 +409,18 @@ function App() {
             </span>
           </div>
 
+          {onlineUsers.length > 0 && (
+            <div className="onlineList">
+              <span className="onlineLabel">No canal:</span>
+              {onlineUsers.map((u) => (
+                <span key={u} className="onlineUser">{u}</span>
+              ))}
+            </div>
+          )}
+
           <div className="videoGrid">
             <div className="videoCard">
-              <p>Você {sharing ? '(Tela)' : ''}</p>
+              <p>Você {sharing ? '(Tela)' : ''} {!hasVideo && connected ? '(Só áudio)' : ''}</p>
               <video ref={localVideoRef} autoPlay muted playsInline />
             </div>
             <div className="videoCard">
